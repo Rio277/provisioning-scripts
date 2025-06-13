@@ -52,7 +52,7 @@ function provisioning_start() {
         "${WORKFLOWS[@]}"
     # Get licensed models if HF_TOKEN set & valid
     if provisioning_has_valid_hf_token; then
-        CHECKPOINT_MODELS+=("https://huggingface.co/Comfy-Org/flux1-schnell/blob/main/flux1-schnell-fp8.safetensors")
+        CHECKPOINT_MODELS+=("https://huggingface.co/Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors")
     fi
     provisioning_get_files \
         "${COMFYUI_DIR}/models/unet" \
