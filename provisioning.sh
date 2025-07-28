@@ -21,10 +21,12 @@ NODES=(
 
 WORKFLOWS=(
     "https://raw.githubusercontent.com/Rio277/provisioning-scripts/refs/heads/main/default-flux-wf.json"
+    "https://raw.githubusercontent.com/Rio277/provisioning-scripts/refs/heads/main/FLUX-schnell-FP16.json"
 )
 
 CLIP_MODELS=(
-    # "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"
+    "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"
+    "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors"
     # "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors"
 )
 
@@ -35,6 +37,9 @@ VAE_MODELS=(
 )
 
 CHECKPOINT_MODELS=(
+)
+
+FLUX_MODELS=(
 )
 
 ### DO NOT EDIT BELOW HERE UNLESS YOU KNOW WHAT YOU ARE DOING ###
@@ -51,7 +56,9 @@ function provisioning_start() {
         "${WORKFLOWS[@]}"
     # Get licensed models if HF_TOKEN set & valid
     if provisioning_has_valid_hf_token; then
+        FLUX_MODELS+=("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors")
         CHECKPOINT_MODELS+=("https://huggingface.co/Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors")
+        VAE_MODELS+=("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors")
     fi
     provisioning_get_files \
         "${COMFYUI_DIR}/models/unet" \
@@ -60,8 +67,11 @@ function provisioning_start() {
         "${COMFYUI_DIR}/models/vae" \
         "${VAE_MODELS[@]}"
     provisioning_get_files \
-        "${COMFYUI_DIR}/models/clip" \
+        "${COMFYUI_DIR}/models/text_encoders" \
         "${CLIP_MODELS[@]}"
+    provisioning_get_files \
+        "${COMFYUI_DIR}/models/diffusion_models" \
+        "${FLUX_MODELS[@]}"
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
