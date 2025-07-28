@@ -23,8 +23,8 @@ logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
-        logging.FileHandler('image_processor.log'),
-        logging.StreamHandler()  # Add console output
+        logging.FileHandler('image_processor.log')
+        # Only log to file, not console
     ]
 )
 logger = logging.getLogger(__name__)
@@ -66,26 +66,20 @@ class ImageProcessor:
                     aws_secret_access_key=r2_secret_key,
                     region_name='auto'  # R2 uses 'auto' region
                 )
-                logger.info("R2 client initialized successfully")
             except Exception as e:
                 logger.error(f"Failed to initialize R2 client: {e}")
                 raise
-        else:
-            logger.warning("R2 credentials not provided. Set via environment variables or parameters.")
     
     def find_matching_images(self) -> List[Path]:
         """Find PNG images matching the naming convention"""
         if not self.directory.exists():
-            logger.error(f"Directory does not exist: {self.directory}")
             return []
         
         matching_files = []
         for file_path in self.directory.iterdir():
             if file_path.is_file() and self.naming_pattern.match(file_path.name):
                 matching_files.append(file_path)
-                logger.info(f"Found matching file: {file_path.name}")
         
-        logger.info(f"Found {len(matching_files)} matching PNG files")
         return matching_files
     
     def convert_png_to_jpg(self, png_path: Path) -> Optional[Path]:
@@ -110,11 +104,9 @@ class ImageProcessor:
                 
                 # Save as JPG
                 img.save(jpg_path, 'JPEG', quality=self.jpg_quality, optimize=True)
-                logger.info(f"Converted {png_path.name} to {jpg_path.name}")
                 return jpg_path
                 
         except Exception as e:
-            logger.error(f"Failed to convert {png_path}: {e}")
             return None
     
     def process_filename_for_upload(self, file_path: Path) -> tuple[str, dict]:
@@ -129,9 +121,9 @@ class ImageProcessor:
         """
         filename = file_path.stem  # Get filename without extension
         
-        # Parse the filename format: {id}-{seed}_{sequence}_
-        # Expected pattern: 1418510004060-890774523686991_00001_
-        pattern = r'^(\d+)-(\d+)_\d+_'
+        # Parse the filename format: pregen_{id}-{seed}_{sequence}_
+        # Expected pattern: pregen_1418510004060-890774523686991_00001_
+        pattern = r'^pregen_(\d+)-(\d+)_\d+_'
         
         match = re.match(pattern, filename)
         
@@ -144,11 +136,9 @@ class ImageProcessor:
                 'seed': seed_value
             }
             
-            logger.info(f"Processed filename: {file_path.name} -> {processed_filename} (seed: {seed_value})")
             return processed_filename, metadata
         else:
             # Fallback for non-matching filenames
-            logger.warning(f"Filename doesn't match expected pattern: {filename}")
             processed_filename = f"{filename}.jpg"
             metadata = {}
             return processed_filename, metadata
@@ -173,11 +163,6 @@ class ImageProcessor:
         # Add metadata if provided
         if metadata:
             extra_args['Metadata'] = metadata
-            logger.info(f"Adding metadata: {metadata}")
-            print(f"📝 Adding metadata: {metadata}")
-        else:
-            logger.info("No metadata to add")
-            print(f"📝 No metadata found for {file_path.name}")
         
         try:
             with open(file_path, 'rb') as file_data:
@@ -187,14 +172,11 @@ class ImageProcessor:
                     object_key,
                     ExtraArgs=extra_args
                 )
-            logger.info(f"Successfully uploaded {file_path.name} to R2 as {object_key}")
             return True
             
         except ClientError as e:
-            logger.error(f"Failed to upload {file_path.name} to R2: {e}")
             return False
         except Exception as e:
-            logger.error(f"Unexpected error uploading {file_path.name}: {e}")
             return False
     
     def cleanup_files(self, png_path: Path, jpg_path: Path, keep_converted: bool = False):
@@ -202,16 +184,12 @@ class ImageProcessor:
         try:
             if png_path.exists():
                 png_path.unlink()
-                logger.info(f"Removed original PNG: {png_path.name}")
             
             if not keep_converted and jpg_path.exists():
                 jpg_path.unlink()
-                logger.info(f"Removed converted JPG: {jpg_path.name}")
-            elif keep_converted:
-                logger.info(f"Kept converted JPG: {jpg_path.name}")
                 
         except Exception as e:
-            logger.error(f"Failed to cleanup files: {e}")
+            pass
     
     def process_images(self, cleanup_on_success: bool = True, keep_converted: bool = False) -> dict:
         """Main processing function"""
@@ -228,17 +206,16 @@ class ImageProcessor:
         
         for png_path in matching_images:
             try:
-                print(f"Processing: {png_path.name}")
-                
                 # Convert PNG to JPG
                 jpg_path = self.convert_png_to_jpg(png_path)
                 if not jpg_path:
-                    print(f"❌ Failed to convert: {png_path.name}")
+                    message = f"❌ {png_path.name} - conversion failed"
+                    print(message)
+                    logger.info(message)
                     results['errors'].append(f"Conversion failed: {png_path.name}")
                     continue
                 
                 results['converted'] += 1
-                print(f"✓ Converted: {png_path.name} -> {jpg_path.name}")
                 
                 # Upload to R2 with processed filename and metadata
                 if self.s3_client:
@@ -246,7 +223,9 @@ class ImageProcessor:
                     _, metadata = self.process_filename_for_upload(png_path)
                     upload_success = self.upload_to_r2(jpg_path, metadata=metadata)
                     if not upload_success:
-                        print(f"❌ Upload failed: {jpg_path.name}")
+                        message = f"❌ {png_path.name} - upload failed"
+                        print(message)
+                        logger.info(message)
                         results['errors'].append(f"Upload failed: {jpg_path.name}")
                         # Clean up JPG file even if upload failed
                         if jpg_path.exists():
@@ -254,37 +233,38 @@ class ImageProcessor:
                         continue
                     
                     results['uploaded'] += 1
-                    print(f"✓ Uploaded: {jpg_path.name}")
+                    status = "uploaded"
                 else:
-                    # For dry run, show the processed filename that would be uploaded
-                    processed_filename, _ = self.process_filename_for_upload(png_path)
-                    _, metadata = self.process_filename_for_upload(png_path)
-                    print(f"✓ Dry run - would upload as: {processed_filename}")
-                    if metadata:
-                        print(f"📝 Would add metadata: {metadata}")
+                    # For dry run
                     results['uploaded'] += 1
+                    status = "dry-run"
                 
                 # Cleanup local files if upload was successful
                 if cleanup_on_success:
                     self.cleanup_files(png_path, jpg_path, keep_converted)
                     results['cleaned'] += 1
-                    if keep_converted:
-                        print(f"✓ Removed PNG, kept JPG: {png_path.name}")
-                    else:
-                        print(f"✓ Cleaned up: {png_path.name}")
+                    cleanup_status = "PNG removed" if keep_converted else "cleaned"
+                else:
+                    cleanup_status = "kept"
+                
+                message = f"✓ {png_path.name} -> {jpg_path.name} ({status}, {cleanup_status})"
+                print(message)
+                logger.info(message)
                     
             except Exception as e:
                 error_msg = f"Error processing {png_path.name}: {e}"
-                logger.error(error_msg)
                 results['errors'].append(error_msg)
+                message = f"❌ {png_path.name} - error: {e}"
+                print(message)
+                logger.info(message)
         
         return results
 
 def main():
     parser = argparse.ArgumentParser(description='Process PNG images and upload to R2')
     parser.add_argument('directory', help='Directory to scan for images')
-    parser.add_argument('--pattern', default=r".*\.png$", 
-                       help='Regex pattern for matching filenames (default: any PNG)')
+    parser.add_argument('--pattern', default=r"pregen_.*\.png$", 
+                       help='Regex pattern for matching filenames (default: pregen_*.png)')
     parser.add_argument('--r2-endpoint', help='R2 endpoint URL')
     parser.add_argument('--r2-access-key', help='R2 access key')
     parser.add_argument('--r2-secret-key', help='R2 secret key')
@@ -324,35 +304,19 @@ def main():
         
         results = processor.process_images(cleanup_on_success=not args.no_cleanup, keep_converted=args.keep_converted)
         
-        # Print summary to both console and log
-        print("=" * 50)
-        print("PROCESSING SUMMARY")
-        print("=" * 50)
-        print(f"Files processed: {results['processed']}")
-        print(f"Successfully converted: {results['converted']}")
-        print(f"Successfully uploaded: {results['uploaded']}")
-        print(f"Files cleaned up: {results['cleaned']}")
-        print(f"Errors: {len(results['errors'])}")
-        
-        logger.info("=" * 50)
-        logger.info("PROCESSING SUMMARY")
-        logger.info("=" * 50)
-        logger.info(f"Files processed: {results['processed']}")
-        logger.info(f"Successfully converted: {results['converted']}")
-        logger.info(f"Successfully uploaded: {results['uploaded']}")
-        logger.info(f"Files cleaned up: {results['cleaned']}")
-        logger.info(f"Errors: {len(results['errors'])}")
+        # Print summary
+        summary = f"Summary: {results['processed']} processed, {results['converted']} converted, {results['uploaded']} uploaded, {results['cleaned']} cleaned, {len(results['errors'])} errors"
+        print(summary)
+        logger.info(summary)
         
         if results['errors']:
-            print("Errors encountered:")
-            logger.error("Errors encountered:")
             for error in results['errors']:
-                print(f"  - {error}")
-                logger.error(f"  - {error}")
+                logger.error(error)
         
         return 0 if not results['errors'] else 1
         
     except Exception as e:
+        print(f"Script failed: {e}")
         logger.error(f"Script failed: {e}")
         return 1
 
