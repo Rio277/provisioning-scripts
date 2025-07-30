@@ -37,7 +37,12 @@ logger = logging.getLogger(__name__)
 
 class UploadTracker:
     def __init__(self, db_path: str = "upload_tracker.db"):
-        self.db_path = db_path
+        # Always place database in the same directory as the script
+        script_dir = Path(__file__).parent.absolute()
+        if not os.path.isabs(db_path):
+            self.db_path = script_dir / db_path
+        else:
+            self.db_path = Path(db_path)
         self.db_lock = Lock()
         self.init_db()
     
