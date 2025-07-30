@@ -16,6 +16,8 @@ from PIL import Image, ImageFile
 import argparse
 import sqlite3
 from datetime import datetime
+import json
+import configparser
 
 # Enable loading of truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -319,6 +321,40 @@ class ImageProcessor:
         
         return results
 
+def load_config(config_path: str) -> dict:
+    """Load R2 credentials from config file (JSON or INI format)"""
+    config_file = Path(config_path)
+    if not config_file.exists():
+        return {}
+    
+    try:
+        # Try JSON format first
+        if config_path.endswith('.json'):
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+                return {
+                    'r2_endpoint': config.get('r2_endpoint'),
+                    'r2_access_key': config.get('r2_access_key'),
+                    'r2_secret_key': config.get('r2_secret_key'),
+                    'bucket_name': config.get('bucket_name')
+                }
+        
+        # Try INI format
+        else:
+            config = configparser.ConfigParser()
+            config.read(config_path)
+            r2_section = config['r2'] if 'r2' in config else config['DEFAULT']
+            return {
+                'r2_endpoint': r2_section.get('endpoint'),
+                'r2_access_key': r2_section.get('access_key'),
+                'r2_secret_key': r2_section.get('secret_key'),
+                'bucket_name': r2_section.get('bucket_name')
+            }
+    
+    except Exception as e:
+        logger.error(f"Failed to load config file {config_path}: {e}")
+        return {}
+
 def main():
     parser = argparse.ArgumentParser(description='Process PNG images and upload to R2')
     parser.add_argument('directory', help='Directory to scan for images')
@@ -335,19 +371,31 @@ def main():
                        help='Process files locally without uploading to R2')
     parser.add_argument('--keep-converted', action='store_true',
                        help='Keep converted JPG files, only remove original PNG files')
+    parser.add_argument('--config', help='Path to config file (JSON or INI format)')
     
     args = parser.parse_args()
     
-    # Get credentials from environment if not provided as arguments
-    r2_endpoint = args.r2_endpoint or os.getenv('R2_ENDPOINT')
-    r2_access_key = args.r2_access_key or os.getenv('R2_ACCESS_KEY')
-    r2_secret_key = args.r2_secret_key or os.getenv('R2_SECRET_KEY')
+    # Load config file if provided
+    config = {}
+    if args.config:
+        config = load_config(args.config)
+    
+    # Get credentials from config file, environment variables, or arguments (in that order of priority)
+    r2_endpoint = args.r2_endpoint or config.get('r2_endpoint') or os.getenv('R2_ENDPOINT')
+    r2_access_key = args.r2_access_key or config.get('r2_access_key') or os.getenv('R2_ACCESS_KEY')
+    r2_secret_key = args.r2_secret_key or config.get('r2_secret_key') or os.getenv('R2_SECRET_KEY')
+    bucket_name = args.bucket or config.get('bucket_name')
     
     if not args.dry_run and not all([r2_endpoint, r2_access_key, r2_secret_key]):
-        logger.error("R2 credentials must be provided via arguments or environment variables:")
+        logger.error("R2 credentials must be provided via config file, arguments, or environment variables:")
+        logger.error("  --config config.json")
         logger.error("  --r2-endpoint or R2_ENDPOINT")
         logger.error("  --r2-access-key or R2_ACCESS_KEY")
         logger.error("  --r2-secret-key or R2_SECRET_KEY")
+        return 1
+    
+    if not bucket_name:
+        logger.error("Bucket name must be provided via --bucket argument or config file")
         return 1
     
     try:
@@ -357,7 +405,7 @@ def main():
             r2_endpoint=r2_endpoint if not args.dry_run else None,
             r2_access_key=r2_access_key if not args.dry_run else None,
             r2_secret_key=r2_secret_key if not args.dry_run else None,
-            bucket_name=args.bucket,
+            bucket_name=bucket_name,
             jpg_quality=args.quality,
             track_uploads=True
         )

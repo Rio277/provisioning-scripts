@@ -1,0 +1,6 @@
+{
+    "r2_endpoint": "https://your-account-id.r2.cloudflarestorage.com",
+    "r2_access_key": "your-access-key-here",
+    "r2_secret_key": "your-secret-key-here",
+    "bucket_name": "your-bucket-name"
+}
