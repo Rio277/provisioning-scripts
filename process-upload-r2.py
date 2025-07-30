@@ -348,6 +348,7 @@ class ImageProcessor:
         
         return result
     
+    def process_images(self, cleanup_on_success: bool = True, keep_converted: bool = False) -> dict:
         """Main processing function with concurrent processing"""
         results = {
             'processed': 0,
