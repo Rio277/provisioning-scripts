@@ -1,2 +1,4 @@
 *.log
 test-images/
+r2-config.ini
+r2-config.json

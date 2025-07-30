@@ -18,6 +18,8 @@ import sqlite3
 from datetime import datetime
 import json
 import configparser
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
 
 # Enable loading of truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -36,6 +38,7 @@ logger = logging.getLogger(__name__)
 class UploadTracker:
     def __init__(self, db_path: str = "upload_tracker.db"):
         self.db_path = db_path
+        self.db_lock = Lock()
         self.init_db()
     
     def init_db(self):
@@ -52,21 +55,52 @@ class UploadTracker:
     
     def is_uploaded(self, card_id: str) -> bool:
         """Check if card_id has already been uploaded"""
-        with sqlite3.connect(self.db_path) as conn:
-            cursor = conn.execute(
-                "SELECT status FROM upload_status WHERE card_id = ? AND status = 'uploaded'",
-                (card_id,)
-            )
-            return cursor.fetchone() is not None
+        with self.db_lock:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    "SELECT status FROM upload_status WHERE card_id = ? AND status = 'uploaded'",
+                    (card_id,)
+                )
+                return cursor.fetchone() is not None
     
     def mark_uploaded(self, card_id: str):
         """Mark card_id as uploaded"""
-        with sqlite3.connect(self.db_path) as conn:
-            conn.execute("""
-                INSERT OR REPLACE INTO upload_status (card_id, status, timestamp)
-                VALUES (?, 'uploaded', ?)
-            """, (card_id, datetime.now().isoformat()))
-            conn.commit()
+        with self.db_lock:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("""
+                    INSERT OR REPLACE INTO upload_status (card_id, status, timestamp)
+                    VALUES (?, 'uploaded', ?)
+                """, (card_id, datetime.now().isoformat()))
+                conn.commit()
+    
+    def batch_mark_uploaded(self, card_ids: List[str]):
+        """Mark multiple card_ids as uploaded in a single transaction"""
+        if not card_ids:
+            return
+        
+        with self.db_lock:
+            with sqlite3.connect(self.db_path) as conn:
+                timestamp = datetime.now().isoformat()
+                data = [(card_id, 'uploaded', timestamp) for card_id in card_ids]
+                conn.executemany("""
+                    INSERT OR REPLACE INTO upload_status (card_id, status, timestamp)
+                    VALUES (?, ?, ?)
+                """, data)
+                conn.commit()
+    
+    def batch_check_uploaded(self, card_ids: List[str]) -> set:
+        """Check multiple card_ids and return set of already uploaded ones"""
+        if not card_ids:
+            return set()
+        
+        with self.db_lock:
+            with sqlite3.connect(self.db_path) as conn:
+                placeholders = ','.join('?' * len(card_ids))
+                cursor = conn.execute(
+                    f"SELECT card_id FROM upload_status WHERE card_id IN ({placeholders}) AND status = 'uploaded'",
+                    card_ids
+                )
+                return {row[0] for row in cursor.fetchall()}
 
 class ImageProcessor:
     def __init__(self, 
@@ -77,7 +111,8 @@ class ImageProcessor:
                  r2_secret_key: str = None,
                  bucket_name: str = None,
                  jpg_quality: int = 85,
-                 track_uploads: bool = True):
+                 track_uploads: bool = True,
+                 max_workers: int = 4):
         """
         Initialize the ImageProcessor
         
@@ -90,11 +125,13 @@ class ImageProcessor:
             bucket_name: R2 bucket name
             jpg_quality: JPEG quality (1-100, default: 85)
             track_uploads: Whether to track uploaded files to avoid duplicates
+            max_workers: Maximum number of concurrent workers (default: 4)
         """
         self.directory = Path(directory)
         self.naming_pattern = re.compile(naming_pattern, re.IGNORECASE)
         self.bucket_name = bucket_name
         self.jpg_quality = jpg_quality
+        self.max_workers = max_workers
         self.tracker = UploadTracker() if track_uploads else None
         
         # Initialize R2 client
@@ -233,8 +270,85 @@ class ImageProcessor:
         except Exception as e:
             pass
     
-    def process_images(self, cleanup_on_success: bool = True, keep_converted: bool = False) -> dict:
-        """Main processing function"""
+    def process_single_image(self, png_path: Path, cleanup_on_success: bool = True, keep_converted: bool = False) -> dict:
+        """Process a single image (for use in concurrent processing)"""
+        result = {
+            'processed': 0,
+            'converted': 0,
+            'uploaded': 0,
+            'cleaned': 0,
+            'errors': [],
+            'card_id': None
+        }
+        
+        try:
+            # Cache filename processing to avoid redundant calls
+            processed_filename, metadata = self.process_filename_for_upload(png_path)
+            card_id = processed_filename.replace('.jpg', '')
+            result['card_id'] = card_id
+            
+            # Check if already uploaded (thread-safe)
+            if self.tracker and self.tracker.is_uploaded(card_id):
+                message = f"⏩ {png_path.name} - already uploaded (skipped)"
+                print(message)
+                logger.info(message)
+                return result
+            
+            result['processed'] = 1
+            
+            # Convert PNG to JPG
+            jpg_path = self.convert_png_to_jpg(png_path)
+            if not jpg_path:
+                message = f"❌ {png_path.name} - conversion failed"
+                print(message)
+                logger.info(message)
+                result['errors'].append(f"Conversion failed: {png_path.name}")
+                return result
+            
+            result['converted'] = 1
+            
+            # Upload to R2 with processed filename and metadata
+            if self.s3_client:
+                upload_success = self.upload_to_r2(jpg_path, processed_filename, metadata)
+                if not upload_success:
+                    message = f"❌ {png_path.name} - upload failed"
+                    print(message)
+                    logger.info(message)
+                    result['errors'].append(f"Upload failed: {jpg_path.name}")
+                    # Clean up JPG file even if upload failed
+                    if jpg_path.exists():
+                        jpg_path.unlink()
+                    return result
+                
+                result['uploaded'] = 1
+                status = "uploaded"
+            else:
+                # For dry run
+                result['uploaded'] = 1
+                status = "dry-run"
+            
+            # Cleanup local files if upload was successful
+            if cleanup_on_success:
+                self.cleanup_files(png_path, jpg_path, keep_converted)
+                result['cleaned'] = 1
+                cleanup_status = "PNG removed" if keep_converted else "cleaned"
+            else:
+                cleanup_status = "kept"
+            
+            message = f"✓ {png_path.name} -> {jpg_path.name} ({status}, {cleanup_status})"
+            print(message)
+            logger.info(message)
+            
+        except Exception as e:
+            error_msg = f"Error processing {png_path.name}: {e}"
+            result['errors'].append(error_msg)
+            message = f"❌ {png_path.name} - error: {e}"
+            print(message)
+            logger.info(message)
+        
+        return result
+    
+        """Main processing function with concurrent processing"""
         results = {
             'processed': 0,
             'converted': 0,
@@ -244,80 +358,51 @@ class ImageProcessor:
         }
         
         matching_images = self.find_matching_images()
-        results['processed'] = len(matching_images)
+        if not matching_images:
+            return results
         
-        for png_path in matching_images:
+        print(f"Processing {len(matching_images)} images with {self.max_workers} concurrent workers...")
+        
+        # For batch database operations
+        successfully_uploaded_cards = []
+        
+        # Process images concurrently
+        with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+            # Submit all tasks
+            future_to_path = {
+                executor.submit(self.process_single_image, png_path, cleanup_on_success, keep_converted): png_path 
+                for png_path in matching_images
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_path):
+                try:
+                    result = future.result()
+                    
+                    # Aggregate results
+                    results['processed'] += result['processed']
+                    results['converted'] += result['converted']
+                    results['uploaded'] += result['uploaded']
+                    results['cleaned'] += result['cleaned']
+                    results['errors'].extend(result['errors'])
+                    
+                    # Collect card IDs for batch database update
+                    if result['uploaded'] > 0 and result['card_id'] and self.tracker and self.s3_client:
+                        successfully_uploaded_cards.append(result['card_id'])
+                        
+                except Exception as e:
+                    png_path = future_to_path[future]
+                    error_msg = f"Future execution error for {png_path.name}: {e}"
+                    results['errors'].append(error_msg)
+                    logger.error(error_msg)
+        
+        # Batch update database for all successfully uploaded files
+        if successfully_uploaded_cards and self.tracker:
             try:
-                # Extract card_id to check if already uploaded
-                _, metadata = self.process_filename_for_upload(png_path)
-                if self.tracker:
-                    # Get card_id from processed filename
-                    processed_filename, _ = self.process_filename_for_upload(png_path)
-                    card_id = processed_filename.replace('.jpg', '')
-                    
-                    if self.tracker.is_uploaded(card_id):
-                        message = f"⏩ {png_path.name} - already uploaded (skipped)"
-                        print(message)
-                        logger.info(message)
-                        results['processed'] -= 1  # Don't count as processed
-                        continue
-                
-                # Convert PNG to JPG
-                jpg_path = self.convert_png_to_jpg(png_path)
-                if not jpg_path:
-                    message = f"❌ {png_path.name} - conversion failed"
-                    print(message)
-                    logger.info(message)
-                    results['errors'].append(f"Conversion failed: {png_path.name}")
-                    continue
-                
-                results['converted'] += 1
-                
-                # Upload to R2 with processed filename and metadata
-                if self.s3_client:
-                    # Get metadata from the original PNG filename
-                    processed_filename, metadata = self.process_filename_for_upload(png_path)
-                    upload_success = self.upload_to_r2(jpg_path, metadata=metadata)
-                    if not upload_success:
-                        message = f"❌ {png_path.name} - upload failed"
-                        print(message)
-                        logger.info(message)
-                        results['errors'].append(f"Upload failed: {jpg_path.name}")
-                        # Clean up JPG file even if upload failed
-                        if jpg_path.exists():
-                            jpg_path.unlink()
-                        continue
-                    
-                    results['uploaded'] += 1
-                    status = "uploaded"
-                    
-                    # Mark as uploaded in tracker
-                    if self.tracker:
-                        card_id = processed_filename.replace('.jpg', '')
-                        self.tracker.mark_uploaded(card_id)
-                else:
-                    # For dry run
-                    results['uploaded'] += 1
-                    status = "dry-run"
-                
-                # Cleanup local files if upload was successful
-                if cleanup_on_success:
-                    self.cleanup_files(png_path, jpg_path, keep_converted)
-                    results['cleaned'] += 1
-                    cleanup_status = "PNG removed" if keep_converted else "cleaned"
-                else:
-                    cleanup_status = "kept"
-                
-                message = f"✓ {png_path.name} -> {jpg_path.name} ({status}, {cleanup_status})"
-                print(message)
-                logger.info(message)
-                    
+                self.tracker.batch_mark_uploaded(successfully_uploaded_cards)
+                logger.info(f"Batch updated {len(successfully_uploaded_cards)} upload records")
             except Exception as e:
-                error_msg = f"Error processing {png_path.name}: {e}"
-                results['errors'].append(error_msg)
-                message = f"❌ {png_path.name} - error: {e}"
-                print(message)
-                logger.info(message)
+                logger.error(f"Failed to batch update upload records: {e}")
         
         return results
 
@@ -372,6 +457,8 @@ def main():
     parser.add_argument('--keep-converted', action='store_true',
                        help='Keep converted JPG files, only remove original PNG files')
     parser.add_argument('--config', help='Path to config file (JSON or INI format)')
+    parser.add_argument('--max-workers', type=int, default=4,
+                       help='Maximum number of concurrent workers (default: 4)')
     
     args = parser.parse_args()
     
@@ -407,7 +494,8 @@ def main():
             r2_secret_key=r2_secret_key if not args.dry_run else None,
             bucket_name=bucket_name,
             jpg_quality=args.quality,
-            track_uploads=True
+            track_uploads=True,
+            max_workers=args.max_workers
         )
         
         results = processor.process_images(cleanup_on_success=not args.no_cleanup, keep_converted=args.keep_converted)
