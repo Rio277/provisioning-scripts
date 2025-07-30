@@ -249,13 +249,20 @@ class ImageProcessor:
             extra_args['Metadata'] = metadata
         
         try:
+            # Read full file content into memory first
             with open(file_path, 'rb') as file_data:
-                self.s3_client.upload_fileobj(
-                    file_data,
-                    self.bucket_name,
-                    object_key,
-                    ExtraArgs=extra_args
-                )
+                file_bytes = file_data.read()
+            
+            # Upload with complete file bytes in body
+            self.s3_client.put_object(
+                Bucket=self.bucket_name,
+                Key=object_key,
+                Body=file_bytes,
+                ContentType='image/jpeg',
+                CacheControl='public, max-age=31536000, immutable',
+                ContentEncoding='identity',
+                Metadata=metadata or {}
+            )
             return True
             
         except ClientError as e:
