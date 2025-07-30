@@ -14,6 +14,8 @@ import boto3
 from botocore.exceptions import ClientError, NoCredentialsError
 from PIL import Image, ImageFile
 import argparse
+import sqlite3
+from datetime import datetime
 
 # Enable loading of truncated images
 ImageFile.LOAD_TRUNCATED_IMAGES = True
@@ -29,6 +31,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+class UploadTracker:
+    def __init__(self, db_path: str = "upload_tracker.db"):
+        self.db_path = db_path
+        self.init_db()
+    
+    def init_db(self):
+        """Initialize SQLite database with upload tracking table"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS upload_status (
+                    card_id TEXT PRIMARY KEY,
+                    status TEXT NOT NULL,
+                    timestamp TEXT NOT NULL
+                )
+            """)
+            conn.commit()
+    
+    def is_uploaded(self, card_id: str) -> bool:
+        """Check if card_id has already been uploaded"""
+        with sqlite3.connect(self.db_path) as conn:
+            cursor = conn.execute(
+                "SELECT status FROM upload_status WHERE card_id = ? AND status = 'uploaded'",
+                (card_id,)
+            )
+            return cursor.fetchone() is not None
+    
+    def mark_uploaded(self, card_id: str):
+        """Mark card_id as uploaded"""
+        with sqlite3.connect(self.db_path) as conn:
+            conn.execute("""
+                INSERT OR REPLACE INTO upload_status (card_id, status, timestamp)
+                VALUES (?, 'uploaded', ?)
+            """, (card_id, datetime.now().isoformat()))
+            conn.commit()
+
 class ImageProcessor:
     def __init__(self, 
                  directory: str,
@@ -37,7 +74,8 @@ class ImageProcessor:
                  r2_access_key: str = None,
                  r2_secret_key: str = None,
                  bucket_name: str = None,
-                 jpg_quality: int = 85):
+                 jpg_quality: int = 85,
+                 track_uploads: bool = True):
         """
         Initialize the ImageProcessor
         
@@ -49,11 +87,13 @@ class ImageProcessor:
             r2_secret_key: R2 secret key
             bucket_name: R2 bucket name
             jpg_quality: JPEG quality (1-100, default: 85)
+            track_uploads: Whether to track uploaded files to avoid duplicates
         """
         self.directory = Path(directory)
         self.naming_pattern = re.compile(naming_pattern, re.IGNORECASE)
         self.bucket_name = bucket_name
         self.jpg_quality = jpg_quality
+        self.tracker = UploadTracker() if track_uploads else None
         
         # Initialize R2 client
         self.s3_client = None
@@ -123,7 +163,7 @@ class ImageProcessor:
         
         # Parse the filename format: pregen_{id}-{seed}_{sequence}_
         # Expected pattern: pregen_1418510004060-890774523686991_00001_
-        pattern = r'^pregen_(\d+)-(\d+)_\d+_'
+        pattern = r'^pregen_(\d+)-(\d+)_\d+_$'
         
         match = re.match(pattern, filename)
         
@@ -206,6 +246,20 @@ class ImageProcessor:
         
         for png_path in matching_images:
             try:
+                # Extract card_id to check if already uploaded
+                _, metadata = self.process_filename_for_upload(png_path)
+                if self.tracker:
+                    # Get card_id from processed filename
+                    processed_filename, _ = self.process_filename_for_upload(png_path)
+                    card_id = processed_filename.replace('.jpg', '')
+                    
+                    if self.tracker.is_uploaded(card_id):
+                        message = f"⏩ {png_path.name} - already uploaded (skipped)"
+                        print(message)
+                        logger.info(message)
+                        results['processed'] -= 1  # Don't count as processed
+                        continue
+                
                 # Convert PNG to JPG
                 jpg_path = self.convert_png_to_jpg(png_path)
                 if not jpg_path:
@@ -220,7 +274,7 @@ class ImageProcessor:
                 # Upload to R2 with processed filename and metadata
                 if self.s3_client:
                     # Get metadata from the original PNG filename
-                    _, metadata = self.process_filename_for_upload(png_path)
+                    processed_filename, metadata = self.process_filename_for_upload(png_path)
                     upload_success = self.upload_to_r2(jpg_path, metadata=metadata)
                     if not upload_success:
                         message = f"❌ {png_path.name} - upload failed"
@@ -234,6 +288,11 @@ class ImageProcessor:
                     
                     results['uploaded'] += 1
                     status = "uploaded"
+                    
+                    # Mark as uploaded in tracker
+                    if self.tracker:
+                        card_id = processed_filename.replace('.jpg', '')
+                        self.tracker.mark_uploaded(card_id)
                 else:
                     # For dry run
                     results['uploaded'] += 1
@@ -263,8 +322,8 @@ class ImageProcessor:
 def main():
     parser = argparse.ArgumentParser(description='Process PNG images and upload to R2')
     parser.add_argument('directory', help='Directory to scan for images')
-    parser.add_argument('--pattern', default=r"pregen_.*\.png$", 
-                       help='Regex pattern for matching filenames (default: pregen_*.png)')
+    parser.add_argument('--pattern', default=r"pregen_\d+-\d+_\d+_\.png$", 
+                       help='Regex pattern for matching filenames (default: pregen_{id}-{seed}_{seq}_.png)')
     parser.add_argument('--r2-endpoint', help='R2 endpoint URL')
     parser.add_argument('--r2-access-key', help='R2 access key')
     parser.add_argument('--r2-secret-key', help='R2 secret key')
@@ -299,7 +358,8 @@ def main():
             r2_access_key=r2_access_key if not args.dry_run else None,
             r2_secret_key=r2_secret_key if not args.dry_run else None,
             bucket_name=args.bucket,
-            jpg_quality=args.quality
+            jpg_quality=args.quality,
+            track_uploads=True
         )
         
         results = processor.process_images(cleanup_on_success=not args.no_cleanup, keep_converted=args.keep_converted)
