@@ -11,8 +11,7 @@ APT_PACKAGES=(
 )
 
 PIP_PACKAGES=(
-    #"package-1"
-    #"package-2"
+    "boto3"
 )
 
 NODES=(
@@ -24,10 +23,13 @@ WORKFLOWS=(
     "https://raw.githubusercontent.com/Rio277/provisioning-scripts/refs/heads/main/FLUX-schnell-FP16.json"
 )
 
+SCRIPT=(
+    "https://raw.githubusercontent.com/Rio277/provisioning-scripts/refs/heads/main/process-upload-r2.py"
+)
+
 CLIP_MODELS=(
     "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/clip_l.safetensors"
     "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp8_e4m3fn.safetensors"
-    # "https://huggingface.co/comfyanonymous/flux_text_encoders/resolve/main/t5xxl_fp16.safetensors"
 )
 
 UNET_MODELS=(
@@ -57,7 +59,6 @@ function provisioning_start() {
     # Get licensed models if HF_TOKEN set & valid
     if provisioning_has_valid_hf_token; then
         FLUX_MODELS+=("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/flux1-schnell.safetensors")
-        CHECKPOINT_MODELS+=("https://huggingface.co/Comfy-Org/flux1-schnell/resolve/main/flux1-schnell-fp8.safetensors")
         VAE_MODELS+=("https://huggingface.co/black-forest-labs/FLUX.1-schnell/resolve/main/ae.safetensors")
     fi
     provisioning_get_files \
@@ -75,6 +76,9 @@ function provisioning_start() {
     provisioning_get_files \
         "${COMFYUI_DIR}/models/checkpoints" \
         "${CHECKPOINT_MODELS[@]}"
+    provisioning_get_files \
+        "${WORKSPACE}" \
+        "${SCRIPT[@]}"
     provisioning_print_end
 }
 
